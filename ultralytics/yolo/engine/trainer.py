@@ -33,7 +33,7 @@ from ultralytics.yolo.utils.files import get_latest_run, increment_path
 from ultralytics.yolo.utils.torch_utils import (EarlyStopping, ModelEMA, de_parallel, init_seeds, one_cycle,
                                                 select_device, strip_optimizer)
 
-
+from ymir_exc.util import (YmirStage, get_merged_config, write_ymir_monitor_process,write_ymir_training_result)
 class BaseTrainer:
     """
     BaseTrainer
@@ -91,12 +91,19 @@ class BaseTrainer:
         # Dirs
         project = self.args.project or Path(SETTINGS['runs_dir']) / self.args.task
         name = self.args.name or f'{self.args.mode}'
+        
+        if hasattr(self.args, 'tensorboard_dir'):
+            self.tensorboard_dir = Path(self.args.tensorboard_dir)
+        else:
+            self.tensorboard_dir = Path(
+                increment_path(Path(project) / name, exist_ok=self.args.exist_ok if RANK in (-1, 0) else True))
+            
         if hasattr(self.args, 'save_dir'):
             self.save_dir = Path(self.args.save_dir)
         else:
             self.save_dir = Path(
                 increment_path(Path(project) / name, exist_ok=self.args.exist_ok if RANK in (-1, 0) else True))
-        self.wdir = self.save_dir / 'weights'  # weights dir
+        self.wdir = self.save_dir  # weights dir
         if RANK in (-1, 0):
             self.wdir.mkdir(parents=True, exist_ok=True)  # make dir
             self.args.save_dir = str(self.save_dir)
@@ -141,7 +148,7 @@ class BaseTrainer:
         self.loss_names = ['Loss']
         self.csv = self.save_dir / 'results.csv'
         self.plot_idx = [0, 1, 2]
-
+        self.ymir_cfg = get_merged_config()
         # Callbacks
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
         if RANK in (-1, 0):
@@ -291,9 +298,14 @@ class BaseTrainer:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
         epoch = self.epochs  # predefine for resume fully trained model edge cases
+        monitor_epoch_gap = max(1, (self.epochs - self.start_epoch + 1) // 100)
+        monitor_batch_gap = max(1, nb // 100)
         for epoch in range(self.start_epoch, self.epochs):
             self.epoch = epoch
             self.run_callbacks('on_train_epoch_start')
+            if RANK in [0, -1] and (epoch - self.start_epoch) % monitor_epoch_gap == 0:
+                epoch_percent = (epoch - self.start_epoch) / (self.epochs - self.start_epoch + 1)
+                write_ymir_monitor_process(self.ymir_cfg, task='training', naive_stage_percent=epoch_percent, stage=YmirStage.TASK)
             self.model.train()
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
@@ -314,6 +326,10 @@ class BaseTrainer:
             self.optimizer.zero_grad()
             for i, batch in pbar:
                 self.run_callbacks('on_train_batch_start')
+                if RANK in [0, -1] and epoch == self.start_epoch and i % monitor_batch_gap == 0:
+                    epoch_percent = (epoch - self.start_epoch) / (self.epochs - self.start_epoch + 1)
+                    batch_percent = i / nb / (self.epochs - self.start_epoch + 1)
+                    write_ymir_monitor_process(self.ymir_cfg, task='training', naive_stage_percent=batch_percent, stage=YmirStage.TASK)
                 # Warmup
                 ni = i + nb * epoch
                 if ni <= nw:
@@ -425,10 +441,14 @@ class BaseTrainer:
 
         # Save last, best and delete
         torch.save(ckpt, self.last, pickle_module=pickle)
+        write_ymir_training_result(self.ymir_cfg, map50=self.fitness, id='yolov8_last', files=[str(self.last)])
         if self.best_fitness == self.fitness:
             torch.save(ckpt, self.best, pickle_module=pickle)
+            write_ymir_training_result(self.ymir_cfg, map50=self.best_fitness, id='yolov8_best', files=[str(self.best)])
         if (self.epoch > 0) and (self.save_period > 0) and (self.epoch % self.save_period == 0):
             torch.save(ckpt, self.wdir / f'epoch{self.epoch}.pt', pickle_module=pickle)
+            weight_file = str(self.wdir / f'epoch{self.epoch}.pt')
+            write_ymir_training_result(self.ymir_cfg, map50=self.fitness, id='yolov8_epoch_{self.epoch}', files=[weight_file])
         del ckpt
 
     @staticmethod
